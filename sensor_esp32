@@ -1,0 +1,639 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <esp_now.h> 
+#include <esp_wifi.h> 
+
+const char* ssid_AP = "Pista_Slot_2C"; 
+const char* password_AP = "123456789"; 
+
+const int NUM_CARRILES = 2;
+const int pinesSensores[NUM_CARRILES] = {13, 14}; 
+
+volatile unsigned long ultimoDisparoFisico[NUM_CARRILES] = {0, 0};
+volatile unsigned long tiempoDisparo[NUM_CARRILES] = {0, 0};
+volatile bool nuevaVueltaPendiente[NUM_CARRILES] = {false, false};
+
+const int PIN_PAUSA_PISTA = 32; 
+const int PIN_REANUDAR_PISTA = 33; 
+volatile unsigned long ultimoAntireboteComisario = 0; 
+volatile bool peticionPausa = false;
+volatile bool peticionReanudar = false;
+
+const int PIN_BUZZER = 4; 
+const int PIN_RELE = 25; 
+
+// --- VARIABLES DE SONIDO Y SEMÁFORO ---
+volatile bool peticionBuzzer = false;
+unsigned long tiempoInicioBuzzer = 0;
+bool buzzerEncendido = false;
+volatile bool buzzerHabilitado = true; 
+
+volatile bool semaforoHardwareActivo = false;
+unsigned long inicioSemaforo = 0;
+volatile int estadoSemaforoVirtual = 0; // 0=Apagado, 1-5=Rojos, 6=GO
+
+volatile bool carreraActiva = false;
+volatile bool carreraEnEspera = false; 
+volatile unsigned long tiempoTotalPausado = 0;
+volatile unsigned long inicioPausa = 0;
+volatile bool comisarioHabilitado = true; 
+
+enum ModoCarrera { MODO_LIBRE = 0, MODO_VUELTAS = 1, MODO_TIEMPO = 2 };
+volatile ModoCarrera modoActual = MODO_LIBRE;
+volatile int limiteVueltas = 0;
+volatile unsigned long limiteTiempoMs = 0;
+volatile bool carreraFinalizada = false;
+volatile int idGanador = -1; 
+
+int nivelBrilloLED = 5; 
+bool relojDescendente = true; 
+volatile int contadorComandosRx = 0;
+
+struct DatosCarril {
+  volatile int vueltas = 0;
+  volatile unsigned long tiempoUltimaVuelta = 0;
+  volatile unsigned long mejorTiempo = 999999;
+  volatile unsigned long tiempoVueltaActual = 0;
+};
+
+DatosCarril carriles[NUM_CARRILES];
+WebServer server(80);
+Preferences preferences; 
+
+String nombresPilotos[NUM_CARRILES] = {"Piloto 1", "Piloto 2"};
+String modelosAutos[NUM_CARRILES] = {"Auto 1", "Auto 2"};
+int lastreVueltas[NUM_CARRILES] = {0, 0}; 
+int correccionTiempoMs = 0; 
+
+uint8_t direccionBroadcast[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+// --- ESTRUCTURA ACTUALIZADA ---
+typedef struct __attribute__((packed)) EstructuraDatosTx {
+  int vueltasNetas[2];
+  unsigned long ultimaVuelta[2];
+  unsigned long mejorVuelta[2];
+  bool pistaActiva;
+  bool finDeCarrera; 
+  int nivelBrillo;
+  int modoCarrera;           
+  int limiteVueltas;         
+  unsigned long limiteTiempo; 
+  unsigned long tiempoCarrera; 
+  bool relojDescendente;   
+  int estadoSemaforo; // NUEVO DATO P2P
+} EstructuraDatosTx;
+
+EstructuraDatosTx datosParaPantallas;
+unsigned long ultimoEnvioEspNow = 0;
+volatile bool peticionCambioModo = false;
+volatile bool peticionReinicio = false;
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 4, 0)
+void OnDataRecv(const esp_now_recv_info * info, const uint8_t *incomingData, int len) {
+#else
+void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
+#endif
+  if (len >= 3 && incomingData[0] == 0x99) {
+    if (incomingData[1] == 1) peticionReinicio = true;
+    if (incomingData[2] == 1) peticionCambioModo = true;
+    peticionBuzzer = true; 
+  }
+}
+
+unsigned long IRAM_ATTR obtenerTiempoCarrera() {
+  if (carreraActiva) return millis() - tiempoTotalPausado;
+  else return inicioPausa - tiempoTotalPausado;
+}
+
+void IRAM_ATTR ISR_PausaPista() { peticionPausa = true; }
+void IRAM_ATTR ISR_ReanudarPista() { peticionReanudar = true; }
+void IRAM_ATTR ISR_Carril1() { if(!nuevaVueltaPendiente[0]){ tiempoDisparo[0] = millis(); nuevaVueltaPendiente[0] = true; } }
+void IRAM_ATTR ISR_Carril2() { if(!nuevaVueltaPendiente[1]){ tiempoDisparo[1] = millis(); nuevaVueltaPendiente[1] = true; } }
+
+void ejecutarResetVariables(bool iniciarInmediato = true) {
+  carreraFinalizada = false;
+  idGanador = -1;
+  estadoSemaforoVirtual = 0;
+  for(int i=0; i<NUM_CARRILES; i++) {
+    carriles[i].vueltas = 0;
+    carriles[i].tiempoUltimaVuelta = 0;
+    carriles[i].mejorTiempo = 999999;
+    carriles[i].tiempoVueltaActual = 0;
+  }
+  
+  if (iniciarInmediato || modoActual == MODO_LIBRE) {
+    carreraActiva = true; 
+    carreraEnEspera = false;
+  } else {
+    carreraActiva = false; 
+    carreraEnEspera = true;
+  }
+  
+  inicioPausa = millis();
+  tiempoTotalPausado = millis(); 
+}
+
+void handleRoot() {
+  String html = "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<title>Cronometro Slot - 2 Carriles</title>";
+  html += "<style type='text/css'>";
+  html += "body { font-family: 'Arial', sans-serif; text-align: center; background-color: #2b2b2b; color: #ffffff; margin: 0; padding: 20px; padding-bottom: 50px; }";
+  html += ".track-logo { margin: 10px auto; width: 100%; max-width: 450px; display: block; filter: drop-shadow(0px 5px 10px rgba(0,0,0,0.6)); }";
+  html += "#bannerEstado { margin: 15px auto; padding: 10px; max-width: 900px; border-radius: 6px; font-size: 22px; font-weight: bold; text-transform: uppercase; letter-spacing: 2px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); transition: all 0.3s; }";
+  html += "table { margin: 20px auto; border-collapse: collapse; width: 98%; max-width: 900px; background-color: #1e1e1e; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }";
+  html += "th { background-color: #111111; color: #ffcc00; padding: 15px; font-size: 15px; text-transform: uppercase; }";
+  html += "td { padding: 14px; font-size: 18px; font-weight: bold; border-bottom: 1px solid #333333; }";
+  html += ".carril-0 { color: #ffcc00; text-align: left; } .carril-1 { color: #ff3333; text-align: left; }";
+  html += ".dif-leader { color: #aaa; font-style: italic; } .modelo-auto { color: #bbb; font-weight: normal; font-size: 15px; }";
+  html += ".btn { padding: 14px 30px; background-color: #d9534f; color: white; border: none; cursor: pointer; font-size: 18px; border-radius: 5px; font-weight: bold; box-shadow: 0 4px 6px rgba(0,0,0,0.3); transition: 0.2s; margin: 15px auto; display: inline-block; }";
+  html += ".btn:hover { background-color: #c9302c; transform: translateY(-2px); }";
+  html += ".btn-semaforo { background-color: #2ecc71; font-size: 22px; padding: 20px 40px; box-shadow: 0 6px 15px rgba(46,204,113,0.5); animation: pulse 2s infinite; }";
+  html += ".btn-semaforo:hover { background-color: #27ae60; }";
+  html += ".btn-libre { background-color: #f39c12; font-size: 22px; padding: 20px 40px; box-shadow: 0 6px 15px rgba(243,156,18,0.5); }";
+  html += ".btn-libre:hover { background-color: #d68910; }";
+  html += "@keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.05); } 100% { transform: scale(1); } }";
+  html += ".panel-config { background-color: #1e1e1e; padding: 20px; margin: 20px auto; max-width: 900px; border-radius: 8px; border-top: 3px solid #444; display: flex; flex-direction: column; align-items: center; gap: 15px; transition: 0.3s; }";
+  html += ".panel-titulo { color: #aaa; font-size: 18px; font-weight: bold; margin-bottom: 5px; text-transform: uppercase; }";
+  html += ".fila-inputs { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; width: 100%; }";
+  html += ".grupo-input { display: flex; flex-direction: column; align-items: flex-start; background: #2a2a2a; padding: 10px 15px; border-radius: 6px; min-width: 200px; flex: 1; border: 1px solid #333; }";
+  html += "input[type='text'], input[type='number'], select { background: #111; border: 1px solid #555; color: white; padding: 8px; border-radius: 4px; width: 100%; font-weight: bold; box-sizing: border-box; }";
+  html += ".btn-guardar { background-color: #5cb85c; padding: 12px 25px; font-size: 16px; margin-top: 10px; }";
+  html += ".panel-carrera { background-color: #002244; border-top: 3px solid #3399ff; flex-direction: row; flex-wrap: wrap; justify-content: space-between; }";
+  html += ".oculto { display: none !important; }"; 
+  html += "</style></head><body>";
+  
+  html += "<div class='track-logo'><svg viewBox='0 0 500 120' xmlns='http://www.w3.org/2000/svg'><defs><linearGradient id='plateado' x1='0%' y1='0%' x2='0%' y2='100%'><stop offset='0%' style='stop-color:#eeeeee; stop-opacity:1' /><stop offset='50%' style='stop-color:#cccccc; stop-opacity:1' /><stop offset='100%' style='stop-color:#bbbbbb; stop-opacity:1' /></linearGradient></defs><text x='250' y='60' font-family='Arial Black, Impact, sans-serif' font-size='60' font-weight='bold' font-style='italic' fill='url(#plateado)' stroke='#000' stroke-width='3' text-anchor='middle' letter-spacing='-1'>Pista Slot</text><text x='255' y='105' font-family='Arial Black, Impact, sans-serif' font-size='60' font-weight='bold' font-style='italic' fill='#ee2222' stroke='#000' stroke-width='3' text-anchor='middle' letter-spacing='-1'>2 Carriles</text></svg></div>";
+  
+  html += "<div class='panel-config panel-carrera'>";
+  html += "<div style='display:flex; gap:15px; align-items:center; flex-wrap:wrap;'>";
+  html += "<div class='panel-titulo' style='margin:0; color:#3399ff;'>🏁 CONFIGURAR MODO:</div>";
+  
+  html += "<select id='selModo' onchange='actualizarUIModo()' style='width:auto; min-width:180px;'>";
+  html += "<option value='0' " + String(modoActual == MODO_LIBRE ? "selected" : "") + ">Libre (Práctica)</option>";
+  html += "<option value='1' " + String(modoActual == MODO_VUELTAS ? "selected" : "") + ">Por Límite de Vueltas</option>";
+  html += "<option value='2' " + String(modoActual == MODO_TIEMPO ? "selected" : "") + ">Por Límite de Tiempo</option></select>";
+  
+  String displayDiv = (modoActual == MODO_LIBRE) ? "none" : "flex";
+  String txtSufijo = (modoActual == MODO_TIEMPO) ? "minutos" : "vueltas";
+  unsigned long valMostrar = (modoActual == MODO_TIEMPO) ? (limiteTiempoMs / 60000) : limiteVueltas;
+  if (valMostrar == 0) valMostrar = 20; 
+  
+  html += "<div id='divValor' style='display:" + displayDiv + "; align-items:center; gap:10px;'><span id='lblValor'>Límite:</span><input type='number' id='inValor' value='" + String(valMostrar) + "' style='width:80px;'> <span id='lblSufijo'>" + txtSufijo + "</span></div>";
+  html += "</div>";
+  html += "<button class='btn btn-guardar' onclick='configurarCarrera()' style='margin:0; background-color:#3399ff;'>GUARDAR CONFIGURACIÓN</button></div>";
+
+  String claseBoton = (modoActual == MODO_LIBRE) ? "btn btn-libre" : "btn btn-semaforo";
+  String textoBoton = (modoActual == MODO_LIBRE) ? "🔄 REINICIAR (Práctica Libre)" : "🚥 INICIAR CARRERA (Semáforo)";
+  html += "<div id='contSemaforo' style='display:block; margin-top:20px;'><button class='" + claseBoton + "' id='btnLargar' onclick='ejecutarBotonPrincipal()'>" + textoBoton + "</button></div>";
+
+  html += "<div id='bannerEstado' style='background-color:#555;'>CARGANDO ESTADO...</div>";
+
+  html += "<div id='relojContainer' style='display:none; background-color:#002244; margin: 15px auto; padding: 15px; max-width: 900px; border-radius: 8px; border: 2px solid #3399ff; box-shadow: 0 4px 10px rgba(0,0,0,0.5);'>";
+  html += "<div style='color:#3399ff; font-weight:bold; letter-spacing:2px; margin-bottom:5px;'>⏱️ CRONÓMETRO DE CARRERA</div>";
+  html += "<div id='displayReloj' style='font-size: 55px; font-weight: bold; font-family: monospace; color: #ffcc00; text-shadow: 2px 2px 4px #000;'>00:00.0</div>";
+  html += "<button class='btn' style='padding: 8px 15px; font-size: 14px; margin-top: 10px; background-color: #3399ff;' onclick='toggleReloj()'>🔄 Cambiar Ascendente / Descendente</button></div>";
+
+  html += "<table id='tablaPosiciones'><thead><tr><th>Pos</th><th>Piloto</th><th>Auto / Modelo</th><th>Vueltas</th><th>Última Vuelta</th><th>Mejor Tiempo</th><th>Dif. Líder</th></tr></thead><tbody></tbody></table>";
+  html += "<div style='display:flex; justify-content:center; gap:15px; flex-wrap:wrap;'><button class='btn' onclick='toggleVista()' style='background-color:#8e44ad;'>📺 Activar/Desactivar Modo TV</button></div>";
+  
+  html += "<div class='panel-config'><div class='panel-titulo'>⚙️ Inscripción de Pilotos y Vehículos</div><div class='fila-inputs'>";
+  for(int i=0; i<NUM_CARRILES; i++){
+    String color = (i==0) ? "#ffcc00" : "#ff3333";
+    String emoji = (i==0) ? "🟡" : "🔴";
+    html += "<div class='grupo-input'><label style='color:" + color + ";'>" + emoji + " Carril " + String(i+1) + "</label>";
+    html += "<input type='text' id='p" + String(i) + "' value='" + nombresPilotos[i] + "' placeholder='Nombre'>";
+    html += "<input type='text' id='m" + String(i) + "' value='" + modelosAutos[i] + "' placeholder='Marca o Modelo' style='margin-top:6px; font-size:13px;'>";
+    html += "<div style='display:flex; align-items:center; gap:5px; margin-top:6px;'><span style='font-size:12px; color:#bbb;'>Lastre (vtas):</span><input type='number' id='l" + String(i) + "' value='" + String(lastreVueltas[i]) + "'></div></div>";
+  }
+  html += "</div><button class='btn btn-guardar' onclick='enviarConfiguracion()'>Guardar Parrilla de Salida</button></div>";
+  
+  html += "<div class='panel-config'><div class='panel-titulo'>⏱️ Ajustes del Sistema & Diagnóstico</div><div class='fila-inputs'>";
+  html += "<div class='grupo-input' style='max-width:300px;'><label style='color:#fff;'>Brillo Pantallas (Matriz LED):</label>";
+  html += "<input type='range' id='slBrillo' min='0' max='15' value='" + String(nivelBrilloLED) + "' style='width:100%; margin-top:10px;' onchange='cambiarBrillo(this.value)'></div>";
+  html += "<div class='grupo-input' style='max-width:300px;'><label style='color:#3399ff;'>Buzzer (Sonido de Vuelta):</label>";
+  html += "<button onclick='toggleBuzzer()' id='btnBuzzer' style='width:100%; padding:10px; margin-top:10px; border-radius:5px; border:none; font-weight:bold; cursor:pointer; background-color:" + String(buzzerHabilitado ? "#2ecc71" : "#e74c3c") + "; color:white;'>" + String(buzzerHabilitado ? "🔊 ACTIVADO" : "🔇 SILENCIADO") + "</button></div>";
+  
+  html += "<div class='grupo-input' style='max-width:300px; background:#111; border: 2px solid #555;'><label style='color:#ffcc00;'>📡 Estado de Red (Canal 5):</label>";
+  html += "<p style='font-size:14px; margin:5px 0; color:#aaa;'>Comandos RX: <span id='numComandos' style='color:#2ecc71; font-size:20px; font-weight:bold;'>0</span></p>";
+  html += "<p style='font-size:14px; margin:5px 0; color:#aaa;'>Clientes Wi-Fi: <span id='numClientes' style='color:#3399ff; font-size:20px; font-weight:bold;'>0</span></p></div>";
+  html += "</div></div>";
+
+  html += "<script>";
+  html += "const infoCarriles = { 0: { emoji: '🟡', clase: 'carril-0' }, 1: { emoji: '🔴', clase: 'carril-1' } };";
+  
+  html += "function actualizarUIModo() {";
+  html += "  let m = document.getElementById('selModo').value;";
+  html += "  let div = document.getElementById('divValor');";
+  html += "  let lbl = document.getElementById('lblSufijo');";
+  html += "  let btnLargar = document.getElementById('btnLargar');";
+  html += "  if(m == 0) {";
+  html += "    div.style.display = 'none';";
+  html += "    btnLargar.className = 'btn btn-libre';";
+  html += "    btnLargar.innerText = '🔄 REINICIAR (Práctica Libre)';";
+  html += "  } else {";
+  html += "    div.style.display = 'flex';";
+  html += "    lbl.innerText = (m == 1) ? 'vueltas' : 'minutos';";
+  html += "    btnLargar.className = 'btn btn-semaforo';";
+  html += "    btnLargar.innerText = '🚥 INICIAR CARRERA (Semáforo)';";
+  html += "  }";
+  html += "}";
+  
+  html += "function configurarCarrera() { let m = document.getElementById('selModo').value; let v = document.getElementById('inValor').value; fetch('/setCarrera?modo='+m+'&valor='+v).then(()=> alert('Configuración Guardada.')); }";
+  
+  html += "function ejecutarBotonPrincipal() {";
+  html += "  let m = document.getElementById('selModo').value;";
+  html += "  if(m == 0) { fetch('/reset'); } else { fetch('/prepararLargada').then(() => iniciarSemaforoVisual()); }";
+  html += "}";
+
+  // Sincronización Web del semáforo adaptada a 5 luces
+  html += "function iniciarSemaforoVisual() { ";
+  html += "  let btn = document.getElementById('btnLargar');";
+  html += "  btn.disabled = true;";
+  html += "  btn.innerText = 'Preparando...';";
+  html += "  setTimeout(() => { btn.innerText = '🔴'; }, 0);";
+  html += "  setTimeout(() => { btn.innerText = '🔴🔴'; }, 1000);";
+  html += "  setTimeout(() => { btn.innerText = '🔴🔴🔴'; }, 2000);";
+  html += "  setTimeout(() => { btn.innerText = '🔴🔴🔴🔴'; }, 3000);";
+  html += "  setTimeout(() => { btn.innerText = '🔴🔴🔴🔴🔴'; }, 4000);";
+  html += "  setTimeout(() => { btn.innerText = '🟢 GO GO GO! 🟢'; }, 5000);";
+  html += "  setTimeout(() => { btn.disabled = false; btn.innerText = '🚥 INICIAR CARRERA (Semáforo)'; }, 7500);";
+  html += "}";
+
+  html += "function enviarConfiguracion() { let query = ''; for(let i=0; i<2; i++){ query += `p${i}=${encodeURIComponent(document.getElementById('p'+i).value)}&m${i}=${encodeURIComponent(document.getElementById('m'+i).value)}&l${i}=${encodeURIComponent(document.getElementById('l'+i).value)}&`; } fetch('/guardarPilotos?' + query).then(() => alert('Guardado!')); }";
+  html += "function toggleComisario() { fetch('/toggleComisario'); }";
+  html += "function toggleBuzzer() { fetch('/toggleBuzzer'); }";
+  html += "function cambiarBrillo(val) { fetch('/setBrillo?val=' + val); }";
+  html += "function toggleVista() { document.querySelectorAll('.panel-config').forEach(e => e.classList.toggle('oculto')); }";
+
+  html += "let relojDescendente = true; let tiempoLocal = 0; let tiempoLimite = 0; let corriendo = false; let modoActualJS = 0;";
+  html += "function toggleReloj() { fetch('/toggleRelojDir'); }";
+  html += "function formatTime(ms) { if(ms<0) ms=0; let m=Math.floor(ms/60000); let s=Math.floor((ms%60000)/1000); let d=Math.floor((ms%1000)/100); return (m<10?'0':'')+m+':'+(s<10?'0':'')+s+'.'+d; }";
+  html += "setInterval(() => { if(corriendo) tiempoLocal += 100; if(modoActualJS == 2) { document.getElementById('relojContainer').style.display = 'block'; let tDisp = tiempoLocal; if(relojDescendente) { tDisp = tiempoLimite - tiempoLocal; if(tDisp<0) tDisp=0; } document.getElementById('displayReloj').innerText = formatTime(tDisp); } else { document.getElementById('relojContainer').style.display = 'none'; } }, 100);";
+
+  html += "function pedirDatos() { fetch('/datos').then(res => res.json()).then(data => {";
+  html += "let banner = document.getElementById('bannerEstado');";
+  html += "let txtModo = data.modo == 0 ? 'LIBRE' : (data.modo == 1 ? 'VUELTAS' : 'TIEMPO');";
+  
+  html += "if (data.fin) { banner.innerText = '🏆 FIN DE CARRERA (' + txtModo + ') GANADOR: ' + infoCarriles[data.ganadorId].emoji + ' ' + data.ganadorNombre; banner.style.backgroundColor = '#ffaa00'; banner.style.color = '#000'; banner.style.textShadow = '1px 1px 2px #fff'; }";
+  html += "else if (data.espera) { banner.innerText = '⏳ ESPERANDO LARGADA (' + txtModo + ')'; banner.style.backgroundColor = '#f1c40f'; banner.style.color = '#000'; banner.style.textShadow = 'none'; }";
+  html += "else if(data.activa) { banner.innerText = '🟢 PISTA HABILITADA (' + txtModo + ')'; banner.style.backgroundColor = '#198754'; banner.style.color = '#fff'; banner.style.textShadow = 'none'; }";
+  html += "else { banner.innerText = '🔴 PISTA CORTADA (' + txtModo + ')'; banner.style.backgroundColor = '#dc3545'; banner.style.color = '#fff'; banner.style.textShadow = 'none'; }";
+  
+  html += "corriendo = data.activa && !data.fin && !data.espera; tiempoLocal = data.tCarrera; tiempoLimite = data.tLimite; modoActualJS = data.modo; relojDescendente = data.relojDesc;";
+
+  html += "let listaAutos = data.autos.map((auto, index) => ({ id: index, ...auto }));";
+  html += "listaAutos.sort((a, b) => { if (b.vueltas !== a.vueltas) return b.vueltas - a.vueltas; let mejorA = a.mejor === 0 ? 999999 : a.mejor; let mejorB = b.mejor === 0 ? 999999 : b.mejor; return mejorA - mejorB; });";
+  html += "let lider = listaAutos[0]; let tiempoLider = lider.mejor === 0 ? 0 : lider.mejor; let tbody = document.querySelector('#tablaPosiciones tbody'); let nuevoContenido = '';";
+  html += "listaAutos.forEach((auto, posicion) => { let ult = (auto.ultima/1000).toFixed(3) + 's'; let mej = auto.mejor > 0 ? (auto.mejor/1000).toFixed(3) + 's' : '0.000s'; let difTexto = '-';";
+  html += "if (posicion === 0 && auto.vueltas > 0) { difTexto = '<span style=\"color:#ffcc00;\">LÍDER</span>'; } else if (tiempoLider > 0 && auto.mejor > 0 && auto.vueltas > 0) { if (auto.vueltas < lider.vueltas) { let difVueltas = lider.vueltas - auto.vueltas; difTexto = `+${difVueltas} vta` + (difVueltas > 1 ? 's' : ''); } else { let difTiempo = (auto.mejor - tiempoLider) / 1000; difTexto = `+${difTiempo.toFixed(3)}s`; } }";
+  html += "let nPiloto = infoCarriles[auto.id].emoji + ' ' + auto.nombre; let mAuto = auto.modelo ? auto.modelo : '-';";
+  html += "let textoVueltas = auto.vueltas; if (auto.lastre > 0) { textoVueltas = `${auto.vueltas} <span style='font-size:13px; color:#ff5555; font-weight:normal;' title='Reales: ${auto.reales}'>(-${auto.lastre})</span>`; }";
+  html += "nuevoContenido += `<tr><td style='color:#777;'>${posicion + 1}º</td><td class='${infoCarriles[auto.id].clase}'>${nPiloto}</td><td class='modelo-auto'>${mAuto}</td><td>${textoVueltas}</td><td>${ult}</td><td>${mej}</td><td class='dif-leader'>${difTexto}</td></tr>`;";
+  html += "}); tbody.innerHTML = nuevoContenido; ";
+  html += "setTimeout(pedirDatos, 800); }).catch(e => setTimeout(pedirDatos, 1500)); }";
+  html += "pedirDatos();"; 
+  html += "</script></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleDatos() {
+  String json;
+  json.reserve(500); 
+  json = "{\"activa\":";
+  json += carreraActiva ? "true" : "false";
+  json += ",\"fin\":";
+  json += carreraFinalizada ? "true" : "false";
+  json += ",\"espera\":";
+  json += carreraEnEspera ? "true" : "false";
+  json += ",\"modo\":" + String((int)modoActual);
+  json += ",\"tCarrera\":" + String(obtenerTiempoCarrera());
+  json += ",\"tLimite\":" + String(limiteTiempoMs);
+  json += ",\"relojDesc\":";
+  json += relojDescendente ? "true" : "false";
+  
+  if (idGanador >= 0 && idGanador < NUM_CARRILES) {
+    json += ",\"ganadorId\":" + String(idGanador);
+    json += ",\"ganadorNombre\":\"" + nombresPilotos[idGanador] + "\"";
+  } else {
+    json += ",\"ganadorId\":-1,\"ganadorNombre\":\"\"";
+  }
+  
+  json += ",\"autos\":[";
+  for(int i=0; i<NUM_CARRILES; i++) {
+    int vueltasNetas = carriles[i].vueltas - lastreVueltas[i];
+    json += "{\"nombre\":\"" + nombresPilotos[i] + "\",\"modelo\":\"" + modelosAutos[i] + "\",\"vueltas\":" + String(vueltasNetas) + ",\"reales\":" + String(carriles[i].vueltas) + ",\"lastre\":" + String(lastreVueltas[i]) + ",\"ultima\":" + String(carriles[i].tiempoVueltaActual) + ",\"mejor\":" + String(carriles[i].mejorTiempo == 999999 ? 0 : carriles[i].mejorTiempo) + "}";
+    if(i < NUM_CARRILES - 1) json += ",";
+  }
+  json += "]}";
+  server.send(200, "application/json", json);
+}
+
+void handleToggleRelojDir() {
+  relojDescendente = !relojDescendente;
+  preferences.begin("pista-slot", false);
+  preferences.putBool("relojDesc", relojDescendente);
+  preferences.end();
+  server.send(200, "text/plain", relojDescendente ? "1" : "0");
+}
+
+void handleSetCarrera() {
+  if (server.hasArg("modo")) {
+    modoActual = (ModoCarrera)server.arg("modo").toInt();
+    int valor = server.hasArg("valor") ? server.arg("valor").toInt() : 0;
+    
+    if (modoActual == MODO_VUELTAS) { limiteVueltas = valor; } 
+    else if (modoActual == MODO_TIEMPO) { limiteTiempoMs = (unsigned long)valor * 60000; }
+    
+    preferences.begin("pista-slot", false);
+    preferences.putInt("modoCar", (int)modoActual);
+    preferences.putInt("limVueltas", limiteVueltas);
+    preferences.putULong("limTiempo", limiteTiempoMs);
+    preferences.end();
+    
+    ejecutarResetVariables(false);
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleToggleComisario() {
+  comisarioHabilitado = !comisarioHabilitado;
+  if (!comisarioHabilitado && !carreraActiva && !carreraFinalizada && !carreraEnEspera) {
+    carreraActiva = true;
+    tiempoTotalPausado += (millis() - inicioPausa);
+  }
+  server.send(200, "text/plain", comisarioHabilitado ? "1" : "0");
+}
+
+void handleToggleBuzzer() {
+  buzzerHabilitado = !buzzerHabilitado;
+  preferences.begin("pista-slot", false);
+  preferences.putBool("buzzerEna", buzzerHabilitado);
+  preferences.end();
+  server.send(200, "text/plain", buzzerHabilitado ? "1" : "0");
+}
+
+void handleSetBrillo() {
+  if (server.hasArg("val")) {
+    nivelBrilloLED = server.arg("val").toInt();
+    preferences.begin("pista-slot", false);
+    preferences.putInt("brillo", nivelBrilloLED);
+    preferences.end();
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleGuardarPilotos() {
+  preferences.begin("pista-slot", false); 
+  for (int i = 0; i < NUM_CARRILES; i++) {
+    String pP = "p" + String(i); String pM = "m" + String(i); String pL = "l" + String(i);
+    if (server.hasArg(pP)) { String n = server.arg(pP); n.trim(); if(n.length() == 0) n = "Piloto " + String(i+1); nombresPilotos[i] = n; preferences.putString(pP.c_str(), n); }
+    if (server.hasArg(pM)) { String m = server.arg(pM); m.trim(); if(m.length() == 0) m = "Auto " + String(i+1); modelosAutos[i] = m; preferences.putString(pM.c_str(), m); }
+    if (server.hasArg(pL)) { lastreVueltas[i] = server.arg(pL).toInt(); preferences.putInt(pL.c_str(), lastreVueltas[i]); }
+  }
+  preferences.end(); server.send(200, "text/plain", "OK");
+}
+
+void handleReset() {
+  peticionReinicio = true;
+  peticionBuzzer = true; 
+  contadorComandosRx++;
+  server.send(200, "text/plain", "OK");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000); 
+
+  preferences.begin("pista-slot", true); 
+  for(int i=0; i<NUM_CARRILES; i++) {
+    String keyP = "p" + String(i); String keyM = "m" + String(i); String keyL = "l" + String(i);
+    if(preferences.isKey(keyP.c_str())) nombresPilotos[i] = preferences.getString(keyP.c_str(), nombresPilotos[i]);
+    if(preferences.isKey(keyM.c_str())) modelosAutos[i] = preferences.getString(keyM.c_str(), modelosAutos[i]);
+    if(preferences.isKey(keyL.c_str())) lastreVueltas[i] = preferences.getInt(keyL.c_str(), lastreVueltas[i]);
+  }
+  
+  if(preferences.isKey("buzzerEna")) buzzerHabilitado = preferences.getBool("buzzerEna", true);
+  if(preferences.isKey("brillo")) nivelBrilloLED = preferences.getInt("brillo", 5);
+  if(preferences.isKey("modoCar")) modoActual = (ModoCarrera)preferences.getInt("modoCar", 0);
+  if(preferences.isKey("limVueltas")) limiteVueltas = preferences.getInt("limVueltas", 0);
+  if(preferences.isKey("limTiempo")) limiteTiempoMs = preferences.getULong("limTiempo", 0);
+  if(preferences.isKey("relojDesc")) relojDescendente = preferences.getBool("relojDesc", true);
+  preferences.end();
+
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_RELE, OUTPUT);
+  digitalWrite(PIN_RELE, HIGH);
+
+  for(int i=0; i<NUM_CARRILES; i++) pinMode(pinesSensores[i], INPUT_PULLUP);
+  
+  pinMode(PIN_PAUSA_PISTA, INPUT_PULLUP);
+  pinMode(PIN_REANUDAR_PISTA, INPUT_PULLUP);
+  carreraActiva = true; 
+
+  attachInterrupt(digitalPinToInterrupt(pinesSensores[0]), ISR_Carril1, FALLING);
+  attachInterrupt(digitalPinToInterrupt(pinesSensores[1]), ISR_Carril2, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_PAUSA_PISTA), ISR_PausaPista, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_REANUDAR_PISTA), ISR_ReanudarPista, FALLING);
+
+  WiFi.mode(WIFI_AP); 
+  esp_wifi_set_ps(WIFI_PS_NONE); 
+  
+  IPAddress local_ip(192, 168, 4, 1);
+  IPAddress gateway(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  WiFi.softAPConfig(local_ip, gateway, subnet);
+  WiFi.softAP(ssid_AP, password_AP, 5); 
+
+  if (esp_now_init() != ESP_OK) return;
+  
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, direccionBroadcast, 6);
+  peerInfo.channel = 5;  
+  peerInfo.encrypt = false;
+  peerInfo.ifidx = WIFI_IF_AP; 
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) return;
+  
+  esp_now_register_recv_cb((esp_now_recv_cb_t)OnDataRecv);
+
+  server.on("/cmdModo", []() {
+    peticionCambioModo = true; peticionBuzzer = true; contadorComandosRx++; server.send(200, "text/plain", "OK");
+  });
+  server.on("/toggleComisario", handleToggleComisario);
+  server.on("/toggleBuzzer", handleToggleBuzzer); 
+  server.on("/toggleRelojDir", handleToggleRelojDir); 
+  server.on("/setBrillo", handleSetBrillo); 
+  server.on("/", handleRoot);
+  server.on("/datos", handleDatos);
+  server.on("/guardarPilotos", handleGuardarPilotos);
+  server.on("/setCarrera", handleSetCarrera); 
+  server.on("/reset", handleReset);
+  
+  server.on("/prepararLargada", []() {
+    ejecutarResetVariables(false); 
+    semaforoHardwareActivo = true;
+    inicioSemaforo = millis();
+    server.send(200, "text/plain", "OK");
+  });
+  
+  server.begin();
+}
+
+void loop() {
+  server.handleClient(); 
+  
+  if (peticionReinicio) { peticionReinicio = false; ejecutarResetVariables(true); }
+
+  if (peticionCambioModo) {
+    peticionCambioModo = false;
+    int nuevoModo = (int)modoActual + 1;
+    if (nuevoModo > 2) nuevoModo = 0; 
+    modoActual = (ModoCarrera)nuevoModo;
+    preferences.begin("pista-slot", false); preferences.putInt("modoCar", (int)modoActual); preferences.end();
+    ejecutarResetVariables(true); 
+  }
+
+  bool debeCortarRele = carreraFinalizada || carreraEnEspera;
+  digitalWrite(PIN_RELE, debeCortarRele ? LOW : HIGH);
+
+  if (peticionBuzzer) {
+    peticionBuzzer = false;
+    if(!semaforoHardwareActivo) tone(PIN_BUZZER, 1000); 
+    buzzerEncendido = true;
+    tiempoInicioBuzzer = millis();
+  }
+
+  if (buzzerEncendido && (millis() - tiempoInicioBuzzer > 100)) { noTone(PIN_BUZZER); buzzerEncendido = false; }
+  
+  // --- MÁQUINA DE ESTADOS: SEMÁFORO ESTILO FÓRMULA 1 ---
+  if (semaforoHardwareActivo) {
+    unsigned long tSemaforo = millis() - inicioSemaforo;
+    int estadoSemTemp = 0;
+    
+    if (tSemaforo < 1000) { 
+      estadoSemTemp = 1; 
+      if (tSemaforo < 200) tone(PIN_BUZZER, 440); else noTone(PIN_BUZZER); 
+    } 
+    else if (tSemaforo < 2000) { 
+      estadoSemTemp = 2; 
+      if (tSemaforo >= 1000 && tSemaforo < 1200) tone(PIN_BUZZER, 440); else noTone(PIN_BUZZER); 
+    } 
+    else if (tSemaforo < 3000) { 
+      estadoSemTemp = 3; 
+      if (tSemaforo >= 2000 && tSemaforo < 2200) tone(PIN_BUZZER, 440); else noTone(PIN_BUZZER); 
+    } 
+    else if (tSemaforo < 4000) { 
+      estadoSemTemp = 4; 
+      if (tSemaforo >= 3000 && tSemaforo < 3200) tone(PIN_BUZZER, 440); else noTone(PIN_BUZZER); 
+    } 
+    else if (tSemaforo < 5000) { 
+      estadoSemTemp = 5; 
+      if (tSemaforo >= 4000 && tSemaforo < 4200) tone(PIN_BUZZER, 440); else noTone(PIN_BUZZER); 
+    } 
+    else if (tSemaforo < 6500) { 
+      estadoSemTemp = 6; 
+      if (tSemaforo >= 5000 && tSemaforo < 6000) tone(PIN_BUZZER, 880); else noTone(PIN_BUZZER); 
+    } 
+    else {
+      noTone(PIN_BUZZER);
+      semaforoHardwareActivo = false;
+      estadoSemTemp = 0;
+      if (carreraEnEspera) {
+        carreraEnEspera = false;
+        carreraActiva = true;
+        inicioPausa = millis();
+        tiempoTotalPausado = millis();
+      }
+    }
+    estadoSemaforoVirtual = estadoSemTemp; // Actualiza el estado para enviar a la pantalla
+  }
+  
+  if (carreraActiva && !carreraFinalizada && !carreraEnEspera && modoActual == MODO_TIEMPO) {
+    if (obtenerTiempoCarrera() >= limiteTiempoMs) {
+      carreraFinalizada = true; carreraActiva = false; inicioPausa = millis();
+      int bestId = 0;
+      for(int i = 1; i < NUM_CARRILES; i++) {
+        int vNetaA = carriles[bestId].vueltas - lastreVueltas[bestId];
+        int vNetaB = carriles[i].vueltas - lastreVueltas[i];
+        if (vNetaB > vNetaA) { bestId = i; } else if (vNetaB == vNetaA) {
+          unsigned long mejA = (carriles[bestId].mejorTiempo == 0) ? 99999999 : carriles[bestId].mejorTiempo;
+          unsigned long mejB = (carriles[i].mejorTiempo == 0) ? 99999999 : carriles[i].mejorTiempo;
+          if (mejB < mejA) bestId = i;
+        }
+      }
+      idGanador = bestId;
+    }
+  }
+
+  if (peticionPausa || peticionReanudar) {
+    unsigned long tiempoActualLoop = millis();
+    if (tiempoActualLoop - ultimoAntireboteComisario > 300) {
+      if (comisarioHabilitado && !carreraFinalizada && !carreraEnEspera) {
+        if (peticionPausa && digitalRead(PIN_PAUSA_PISTA) == LOW) {
+          if (carreraActiva) { carreraActiva = false; inicioPausa = tiempoActualLoop; }
+        }
+        else if (peticionReanudar && digitalRead(PIN_REANUDAR_PISTA) == LOW) {
+          if (!carreraActiva) { carreraActiva = true; tiempoTotalPausado += (tiempoActualLoop - inicioPausa); }
+        }
+      }
+      ultimoAntireboteComisario = tiempoActualLoop;
+    }
+    peticionPausa = false; peticionReanudar = false;
+  }
+
+  for(int id=0; id<NUM_CARRILES; id++) {
+    if (nuevaVueltaPendiente[id]) {
+      unsigned long tFisico = tiempoDisparo[id];
+      nuevaVueltaPendiente[id] = false; 
+
+      if (tFisico - ultimoDisparoFisico[id] >= 500) {
+        ultimoDisparoFisico[id] = tFisico;
+
+        if (!carreraActiva || carreraFinalizada || carreraEnEspera) continue; 
+        
+        unsigned long tiempoActualVirtual;
+        if (carreraActiva) tiempoActualVirtual = millis() - tiempoTotalPausado;
+        else tiempoActualVirtual = inicioPausa - tiempoTotalPausado;
+        
+        carriles[id].vueltas++; 
+        if (buzzerHabilitado) peticionBuzzer = true; 
+        
+        if (carriles[id].tiempoUltimaVuelta > 0) { 
+          long tiempoCalculado = (tiempoActualVirtual - carriles[id].tiempoUltimaVuelta) + correccionTiempoMs;
+          if(tiempoCalculado < 0) tiempoCalculado = 0; 
+          carriles[id].tiempoVueltaActual = tiempoCalculado;
+          if (carriles[id].tiempoVueltaActual < carriles[id].mejorTiempo) carriles[id].mejorTiempo = carriles[id].tiempoVueltaActual;
+        }
+        carriles[id].tiempoUltimaVuelta = tiempoActualVirtual;
+
+        if (modoActual == MODO_VUELTAS) {
+          int vueltasNetasActuales = carriles[id].vueltas - lastreVueltas[id];
+          if (vueltasNetasActuales >= limiteVueltas) {
+            carreraFinalizada = true; carreraActiva = false; idGanador = id; inicioPausa = millis(); 
+          }
+        }
+      }
+    }
+  }
+  
+  if (millis() - ultimoEnvioEspNow > 100) {
+    for(int i=0; i<NUM_CARRILES; i++) {
+      datosParaPantallas.vueltasNetas[i] = carriles[i].vueltas - lastreVueltas[i];
+      datosParaPantallas.ultimaVuelta[i] = carriles[i].tiempoVueltaActual;
+      datosParaPantallas.mejorVuelta[i]  = (carriles[i].mejorTiempo == 999999) ? 0 : carriles[i].mejorTiempo;
+    }
+    datosParaPantallas.pistaActiva = carreraActiva && !carreraEnEspera;
+    datosParaPantallas.finDeCarrera = carreraFinalizada;
+    datosParaPantallas.nivelBrillo = nivelBrilloLED; 
+    datosParaPantallas.modoCarrera = (int)modoActual;
+    datosParaPantallas.limiteVueltas = limiteVueltas;
+    datosParaPantallas.limiteTiempo = limiteTiempoMs;
+    datosParaPantallas.tiempoCarrera = obtenerTiempoCarrera();
+    datosParaPantallas.relojDescendente = relojDescendente; 
+    datosParaPantallas.estadoSemaforo = estadoSemaforoVirtual;
+    
+    esp_now_send(direccionBroadcast, (uint8_t *) &datosParaPantallas, sizeof(datosParaPantallas));
+    ultimoEnvioEspNow = millis();
+  }
+  delay(1); 
+}
