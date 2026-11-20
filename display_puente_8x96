@@ -1,0 +1,349 @@
+#include <esp_now.h>
+#include <esp_wifi.h> 
+#include <WiFi.h>
+#include <MD_Parola.h>
+#include <MD_MAX72xx.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 32
+#define OLED_RESET -1 
+
+const int PIN_SDA = 4;
+const int PIN_SCL = 5;
+
+Adafruit_SSD1306 displayOLED(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// --- CONFIGURACIÓN DE 12 MÓDULOS (3 Matrices de 8x32) ---
+#define MAX_DEVICES 12 
+#define HARDWARE_TYPE MD_MAX72XX::FC16_HW 
+
+const int PIN_DATA = 2; 
+const int PIN_CLK  = 1; 
+const int PIN_CS   = 0; 
+
+MD_Parola miPantalla = MD_Parola(HARDWARE_TYPE, PIN_DATA, PIN_CLK, PIN_CS, MAX_DEVICES);
+
+// Mapeo de zonas basado en la cascada física:
+const uint8_t ZONA_CARRIL_1 = 0; // Módulos 0 a 3 (Azul Izquierda)
+const uint8_t ZONA_CARRIL_2 = 1; // Módulos 4 a 7 (Azul Derecha)
+const uint8_t ZONA_SEMAFORO = 2; // Módulos 8 a 11 (Roja Arriba)
+
+char textoC1[50];
+char textoC2[50]; 
+char textoSem[20]; // Buffer para la secuencia de luces
+const char* coloresCarril[] = {"Amarillo", "Rojo"};
+
+const int PIN_SUPER_BOTON = 10; 
+
+typedef struct __attribute__((packed)) EstructuraDatosTx {
+  int vueltasNetas[2]; 
+  unsigned long ultimaVuelta[2];
+  unsigned long mejorVuelta[2];
+  bool pistaActiva;
+  bool finDeCarrera; 
+  int nivelBrillo;
+  int modoCarrera;           
+  int limiteVueltas;         
+  unsigned long limiteTiempo; 
+  unsigned long tiempoCarrera; 
+  bool relojDescendente; 
+  int estadoSemaforo; // NUEVO DATO P2P
+} EstructuraDatosTx;
+EstructuraDatosTx datosRecibidos;
+
+unsigned long ultimoMensajeRx = 0;
+unsigned long tiempoUltimoPaquete = 0;
+const unsigned long TIEMPO_DESCONEXION = 2000; 
+
+// Sistema de Botón y Vistas Locales
+bool botonPresionado = false;
+unsigned long tiempoInicioPulsacion = 0;
+int modoVistaLocal = 0; 
+
+int nivelBrilloActual = 5; 
+int estadoRenderAnterior = -1;
+
+unsigned long ultimoTiempoParpadeo = 0;
+bool estadoParpadeo = false;
+unsigned long ultimoTiempoProgreso = 0;
+int pasoProgreso = 0;
+
+int ultimoModoOled = -1;
+int ultimoLimiteVueltasOled = -1;
+unsigned long ultimoLimiteTiempoOled = 0;
+unsigned long ultimoRefrescoOLED = 0; 
+
+uint8_t macSensor[6];
+bool macCapturada = false;
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 4, 0)
+void OnDataRecv(const esp_now_recv_info * info, const uint8_t *incomingData, int len) {
+  const uint8_t * mac = info->src_addr;
+#else
+void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
+#endif
+  if (!macCapturada) {
+    memcpy(macSensor, mac, 6);
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, macSensor, 6);
+    peerInfo.channel = 5;
+    peerInfo.encrypt = false;
+    esp_now_add_peer(&peerInfo);
+    macCapturada = true;
+  }
+
+  if (len == sizeof(EstructuraDatosTx)) {
+    memcpy(&datosRecibidos, incomingData, sizeof(datosRecibidos));
+    ultimoMensajeRx = millis(); 
+    tiempoUltimoPaquete = millis(); 
+  }
+}
+
+void actualizarOLED() {
+  displayOLED.clearDisplay();
+  displayOLED.setCursor(0, 0); 
+  displayOLED.setTextSize(1);  
+  
+  if (macCapturada && (millis() - ultimoMensajeRx < TIEMPO_DESCONEXION)) { displayOLED.print(F("ENLACE: ESTABLE P2P")); } 
+  else if (macCapturada) { displayOLED.print(F("ENLACE: PERDIDO...")); } 
+  else { displayOLED.print(F("ENLACE: BUSCANDO...")); }
+  
+  displayOLED.setCursor(0, 16); 
+  displayOLED.setTextSize(2);  
+  
+  if (datosRecibidos.modoCarrera == 0) displayOLED.print(F(" LIBRE"));
+  else if (datosRecibidos.modoCarrera == 1) { displayOLED.print(F("VUELTAS: ")); displayOLED.print(datosRecibidos.limiteVueltas); } 
+  else if (datosRecibidos.modoCarrera == 2) { displayOLED.print(F("TIEMPO: ")); displayOLED.print(datosRecibidos.limiteTiempo / 60000); displayOLED.print(F("m")); }
+  
+  displayOLED.display();
+}
+
+void actualizarTextoEstatico(uint8_t zona, char* buffer, const char* nuevoTexto, textEffect_t align = PA_CENTER) {
+  if (strcmp(buffer, nuevoTexto) != 0) {
+    strcpy(buffer, nuevoTexto);
+    miPantalla.displayZoneText(zona, buffer, align, 0, 0, PA_PRINT, PA_NO_EFFECT);
+    miPantalla.displayReset(zona);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_SUPER_BOTON, INPUT_PULLUP);
+
+  Wire.begin(PIN_SDA, PIN_SCL);
+  if(!displayOLED.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { Serial.println(F("OLED fallo")); }
+  displayOLED.setTextColor(SSD1306_WHITE);
+  
+  displayOLED.clearDisplay();
+  displayOLED.setCursor(0, 8);
+  displayOLED.setTextSize(2);
+  displayOLED.print(F(" 2-CARR V6.9.18")); 
+  displayOLED.display();
+
+  miPantalla.begin(3); // AHORA SON 3 ZONAS
+  miPantalla.setZone(ZONA_CARRIL_1, 0, 3);
+  miPantalla.setZone(ZONA_CARRIL_2, 4, 7);
+  miPantalla.setZone(ZONA_SEMAFORO, 8, 11);
+  miPantalla.setIntensity(nivelBrilloActual); 
+
+  // Generamos el caracter circular sólido para las luces del semáforo
+  // (Ancho: 5 columnas + 1 espacio, encaja de lujo en 32 px para 5 luces)
+  uint8_t circulo[5] = { 0x7E, 0xFF, 0xFF, 0xFF, 0x7E };
+  miPantalla.addChar('*', circulo);
+
+  ultimoMensajeRx = millis();
+  ultimoRefrescoOLED = millis(); 
+
+  WiFi.mode(WIFI_STA); 
+  WiFi.disconnect();
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(5, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+
+  if (esp_now_init() == ESP_OK) {
+    esp_now_register_recv_cb((esp_now_recv_cb_t)OnDataRecv); 
+  }
+}
+
+void loop() {
+  miPantalla.displayAnimate(); 
+
+  if (datosRecibidos.nivelBrillo != nivelBrilloActual && datosRecibidos.nivelBrillo >= 0 && datosRecibidos.nivelBrillo <= 15) {
+    nivelBrilloActual = datosRecibidos.nivelBrillo;
+    miPantalla.setIntensity(nivelBrilloActual);
+  }
+
+  // --- BOTÓN VISTAS (ANTIREBOTE) ---
+  static bool ultimoEstadoFisico = HIGH;
+  static bool estadoEstable = HIGH;
+  static unsigned long tiempoDebounce = 0;
+  bool estadoFisico = digitalRead(PIN_SUPER_BOTON);
+  if (estadoFisico != ultimoEstadoFisico) { tiempoDebounce = millis(); }
+  ultimoEstadoFisico = estadoFisico;
+  
+  if ((millis() - tiempoDebounce) > 50) { estadoEstable = estadoFisico; }
+  bool lecturaBoton = (estadoEstable == LOW);
+
+  if (lecturaBoton && !botonPresionado) { botonPresionado = true; tiempoInicioPulsacion = millis(); }
+  if (!lecturaBoton && botonPresionado) {
+    unsigned long tiempoTotalPulsacion = millis() - tiempoInicioPulsacion;
+    botonPresionado = false;
+    if (tiempoTotalPulsacion > 50) {
+      modoVistaLocal++;
+      if (modoVistaLocal > 2) modoVistaLocal = 0;
+      estadoRenderAnterior = -1; // Fuerza re-dibujo
+    }
+  }
+
+  static bool ultimoEstadoMac = false;
+  if (ultimoModoOled != datosRecibidos.modoCarrera || ultimoLimiteVueltasOled != datosRecibidos.limiteVueltas || ultimoLimiteTiempoOled != datosRecibidos.limiteTiempo || ultimoEstadoMac != macCapturada || (millis() - ultimoRefrescoOLED > 5000)) { 
+      actualizarOLED();
+      ultimoModoOled = datosRecibidos.modoCarrera;
+      ultimoLimiteVueltasOled = datosRecibidos.limiteVueltas;
+      ultimoLimiteTiempoOled = datosRecibidos.limiteTiempo;
+      ultimoEstadoMac = macCapturada;
+      ultimoRefrescoOLED = millis(); 
+  }
+
+  if (!datosRecibidos.pistaActiva) {
+    if (millis() - ultimoTiempoParpadeo >= 600) { ultimoTiempoParpadeo = millis(); estadoParpadeo = !estadoParpadeo; }
+  } else { estadoParpadeo = false; }
+
+  // --- RENDERING MATRICES ---
+  static unsigned long ultimoRefreshPantalla = 0;
+  if (millis() - ultimoRefreshPantalla >= 40) {
+    ultimoRefreshPantalla = millis();
+
+    int estadoRenderActual = 0; 
+    if (millis() - ultimoMensajeRx > TIEMPO_DESCONEXION) estadoRenderActual = 1; // Desconectado
+    else if (datosRecibidos.finDeCarrera) estadoRenderActual = 2; // Final
+    else estadoRenderActual = 3; // Carrera Activa
+
+    // 1. GESTIÓN INDEPENDIENTE DE LA ZONA SEMÁFORO (Roja Arriba)
+    static int estadoSemaforoLocal = -1;
+    if (datosRecibidos.estadoSemaforo != estadoSemaforoLocal) {
+      estadoSemaforoLocal = datosRecibidos.estadoSemaforo;
+      char tempSem[20];
+      if (estadoSemaforoLocal == 1) strcpy(tempSem, "*");
+      else if (estadoSemaforoLocal == 2) strcpy(tempSem, "**");
+      else if (estadoSemaforoLocal == 3) strcpy(tempSem, "***");
+      else if (estadoSemaforoLocal == 4) strcpy(tempSem, "****");
+      else if (estadoSemaforoLocal == 5) strcpy(tempSem, "*****");
+      else if (estadoSemaforoLocal == 6) strcpy(tempSem, "GO!");
+      else strcpy(tempSem, ""); // Limpia
+      actualizarTextoEstatico(ZONA_SEMAFORO, textoSem, tempSem, PA_CENTER);
+    }
+
+    // 2. GESTIÓN DE LAS ZONAS DE CARRERAS (Azules Abajo)
+    if (estadoRenderActual != estadoRenderAnterior) {
+      estadoRenderAnterior = estadoRenderActual;
+      bool requiereUnicaLinea = (estadoRenderActual == 1 || estadoRenderActual == 2);
+      static bool esUnicaLinea = false;
+      
+      // Une de forma dinámica los 8 módulos azules (Saltando los rojos del semáforo)
+      if (requiereUnicaLinea != esUnicaLinea) {
+        esUnicaLinea = requiereUnicaLinea;
+        if (esUnicaLinea) {
+          miPantalla.setZone(ZONA_CARRIL_1, 0, 7); // Los 8 módulos azules
+          miPantalla.displayClear(ZONA_CARRIL_2);   // Apaga la zona secundaria
+        } else {
+          miPantalla.setZone(ZONA_CARRIL_1, 0, 3); // Azul Izquierda
+          miPantalla.setZone(ZONA_CARRIL_2, 4, 7); // Azul Derecha
+        }
+      }
+      
+      miPantalla.displayClear(ZONA_CARRIL_1);
+      if (!esUnicaLinea) miPantalla.displayClear(ZONA_CARRIL_2);
+      textoC1[0] = '\0'; textoC2[0] = '\0';
+      
+      if (estadoRenderActual == 1) { 
+        miPantalla.displayZoneText(ZONA_CARRIL_1, textoC1, PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
+      } 
+      else if (estadoRenderActual == 2) { 
+        int maxLaps = -1, winnerLane = 0;
+        for (int i = 0; i < 2; i++) {
+          if (datosRecibidos.vueltasNetas[i] > maxLaps) { maxLaps = datosRecibidos.vueltasNetas[i]; winnerLane = i + 1; }
+        }
+        if (maxLaps == 0) snprintf(textoC1, sizeof(textoC1), "TIEMPO CUMPLIDO!");
+        else {
+          snprintf(textoC1, sizeof(textoC1), "GANADOR %s!", coloresCarril[winnerLane - 1]);
+          for(int k=0; textoC1[k]; k++) textoC1[k] = toupper(textoC1[k]);
+        }
+        miPantalla.displayZoneText(ZONA_CARRIL_1, textoC1, PA_CENTER, 35, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+      } 
+      else if (estadoRenderActual == 3) { 
+        miPantalla.displayZoneText(ZONA_CARRIL_1, textoC1, PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
+        miPantalla.displayZoneText(ZONA_CARRIL_2, textoC2, PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
+      }
+      
+      miPantalla.displayReset(ZONA_CARRIL_1);
+      if (!esUnicaLinea) miPantalla.displayReset(ZONA_CARRIL_2);
+    }
+
+    if (estadoRenderActual == 1) { 
+      if (millis() - ultimoTiempoProgreso >= 300) {
+        ultimoTiempoProgreso = millis();
+        pasoProgreso++;
+        if (pasoProgreso > 4) pasoProgreso = 0;
+        char tempUnido[30];
+        strcpy(tempUnido, "CONEC [");
+        for(int i = 0; i < 3; i++) {
+          if (i < pasoProgreso) strcat(tempUnido, "=");
+          else if (i == pasoProgreso) strcat(tempUnido, ">");
+          else strcat(tempUnido, " ");
+        }
+        strcat(tempUnido, "]");
+        actualizarTextoEstatico(ZONA_CARRIL_1, textoC1, tempUnido, PA_CENTER);
+      }
+    }
+    else if (estadoRenderActual == 2) { 
+      if (miPantalla.getZoneStatus(ZONA_CARRIL_1)) miPantalla.displayReset(ZONA_CARRIL_1);
+    }
+    else if (estadoRenderActual == 3) { 
+      char tempC1[20], tempC2[20];
+      textEffect_t alineacion = PA_CENTER; 
+
+      if (!datosRecibidos.pistaActiva && estadoParpadeo) { 
+        strcpy(tempC1, " "); strcpy(tempC2, " "); 
+      } else { 
+        if (modoVistaLocal == 0) { 
+          if (datosRecibidos.modoCarrera == 2) {
+            unsigned long tiempoLocalSimulado = datosRecibidos.tiempoCarrera;
+            if (datosRecibidos.pistaActiva && !datosRecibidos.finDeCarrera) tiempoLocalSimulado += (millis() - tiempoUltimoPaquete);
+            unsigned long tDisp = (datosRecibidos.relojDescendente && datosRecibidos.limiteTiempo >= tiempoLocalSimulado) ? (datosRecibidos.limiteTiempo - tiempoLocalSimulado) : tiempoLocalSimulado;
+            if (datosRecibidos.relojDescendente && tiempoLocalSimulado > datosRecibidos.limiteTiempo) tDisp = 0;
+            
+            unsigned int mins = tDisp / 60000;
+            unsigned int secs = (tDisp % 60000) / 1000;
+            unsigned int ms = tDisp % 1000;
+            snprintf(tempC1, sizeof(tempC1), "%02d MIN", mins); 
+            snprintf(tempC2, sizeof(tempC2), "%02d:%03d", secs, ms);
+          } else {
+            snprintf(tempC1, sizeof(tempC1), "L1: %03d", datosRecibidos.vueltasNetas[0]);
+            snprintf(tempC2, sizeof(tempC2), "L2: %03d", datosRecibidos.vueltasNetas[1]);
+          }
+        } 
+        else if (modoVistaLocal == 1) { 
+          unsigned int s1 = datosRecibidos.ultimaVuelta[0] / 1000; unsigned int m1 = (datosRecibidos.ultimaVuelta[0] % 1000) / 10; 
+          unsigned int s2 = datosRecibidos.ultimaVuelta[1] / 1000; unsigned int m2 = (datosRecibidos.ultimaVuelta[1] % 1000) / 10;
+          snprintf(tempC1, sizeof(tempC1), "%02d.%02d", s1, m1); snprintf(tempC2, sizeof(tempC2), "%02d.%02d", s2, m2);
+        }
+        else if (modoVistaLocal == 2) { 
+          unsigned int s1 = datosRecibidos.mejorVuelta[0] / 1000; unsigned int m1 = (datosRecibidos.mejorVuelta[0] % 1000) / 10;
+          unsigned int s2 = datosRecibidos.mejorVuelta[1] / 1000; unsigned int m2 = (datosRecibidos.mejorVuelta[1] % 1000) / 10;
+          snprintf(tempC1, sizeof(tempC1), "%02d.%02d", s1, m1); snprintf(tempC2, sizeof(tempC2), "%02d.%02d", s2, m2);
+        }
+      }
+
+      if (miPantalla.getTextAlignment(ZONA_CARRIL_1) != alineacion) miPantalla.displayZoneText(ZONA_CARRIL_1, textoC1, alineacion, 0, 0, PA_PRINT, PA_NO_EFFECT);
+      if (miPantalla.getTextAlignment(ZONA_CARRIL_2) != alineacion) miPantalla.displayZoneText(ZONA_CARRIL_2, textoC2, alineacion, 0, 0, PA_PRINT, PA_NO_EFFECT);
+
+      actualizarTextoEstatico(ZONA_CARRIL_1, textoC1, tempC1, alineacion);
+      actualizarTextoEstatico(ZONA_CARRIL_2, textoC2, tempC2, alineacion); 
+    }
+  } 
+}
